@@ -2,3 +2,7 @@ streamlit
 requests
 pandas
 jinja2
+openpyxl
+atlassian-python-api
+matplotlib
+
