@@ -8,7 +8,7 @@
 ## 🛠️ Последовательность
 - **Склонировать репозиторий**
 ```bash
-git clone https://git.astralinux.ru/users/sesmirnov/repos/jira-budget-tempo/
+git clone https://github.com/adjuster2004/jira-budget-tempo/
 cd jira-budget-tempo
 ```
 
