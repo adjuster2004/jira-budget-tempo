@@ -729,48 +729,117 @@ with st.sidebar:
 
     with st.expander("👥 Tempo Команды (Конфиг)"):
         def fetch_tempo_teams_history(domain, method, token):
-            url = f"https://{domain}/rest/tempo-teams/2/team"
+            # ИСПОЛЬЗУЕМ V2 MEMBER (он у вас работает и отдает JSON)
+            url_base = f"https://{domain}/rest/tempo-teams/2/team"
+
             headers = {"Content-Type": "application/json"}
             cookies = {}
             if method == "Personal Access Token (PAT)":
                 headers["Authorization"] = f"Bearer {token}"
             else:
                 cookies = {"JSESSIONID": token}
+
             try:
-                resp = requests.get(url, headers=headers, cookies=cookies, verify=False)
-                if resp.status_code != 200: return None
+                # 1. Получаем список команд
+                resp = requests.get(url_base, headers=headers, cookies=cookies, verify=False)
+                if resp.status_code != 200:
+                    st.error(f"Ошибка получения команд: {resp.status_code}")
+                    return None
+
                 teams = resp.json()
                 result_map = {}
+
                 prog = st.progress(0)
+                status_text = st.empty()
 
                 for idx, team in enumerate(teams):
                     tid = team.get('id')
                     tname = team.get('name')
-                    m_url = f"https://{domain}/rest/tempo-teams/2/team/{tid}/member"
+                    status_text.text(f"Сканируем команду: {tname}...")
+
+                    # 2. Запрашиваем участников
+                    m_url = f"{url_base}/{tid}/member"
                     m_resp = requests.get(m_url, headers=headers, cookies=cookies, verify=False)
+
                     members_hist = []
                     if m_resp.status_code == 200:
-                        for m in m_resp.json():
+                        raw_members = m_resp.json()
+
+                        for m in raw_members:
+                            # --- БЛОК 1: ДАТЫ (ANSI) ---
+                            # Данные лежат внутри объекта 'membership'
+                            mem_obj = m.get('membership', {})
+
+                            # Приоритет ANSI полям (формат 2024-01-10)
+                            raw_from = mem_obj.get('dateFromANSI')
+                            raw_to = mem_obj.get('dateToANSI')
+
+                            # Если ANSI нет, пробуем обычные (fallback)
+                            if not raw_from: raw_from = mem_obj.get('dateFrom') or m.get('dateFrom')
+                            if not raw_to: raw_to = mem_obj.get('dateTo') or m.get('dateTo')
+
+                            # Парсинг даты начала
+                            d_from = date(2000, 1, 1) # Дефолт
+                            if raw_from and str(raw_from).strip():
+                                parsed = parse_tempo_date(raw_from)
+                                if parsed: d_from = parsed
+
+                            # Парсинг даты конца
+                            d_to = date(2099, 12, 31) # Дефолт
+                            if raw_to and str(raw_to).strip():
+                                parsed = parse_tempo_date(raw_to)
+                                if parsed: d_to = parsed
+
+                            # --- БЛОК 2: ИМЕНА (Защита от None) ---
                             m_info = m.get('member', {})
                             login = m_info.get('name')
-                            real_name = m_info.get('displayName', login)
                             key = m_info.get('key')
 
-                            if login:
-                                memb = m.get('membership', {})
-                                df = parse_tempo_date(memb.get('dateFrom') or m.get('dateFrom')) or date(2000, 1, 1)
-                                dt = parse_tempo_date(memb.get('dateTo') or m.get('dateTo')) or date(2099, 12, 31)
-                                members_hist.append(
-                                    {"login": login, "key": key, "name": real_name, "dateFrom": str(df),
-                                     "dateTo": str(dt)})
-                                if login: st.session_state.global_names_cache[login] = real_name
+                            # Имя из Tempo
+                            real_name = m_info.get('displayName')
 
-                    if members_hist: result_map[tname] = members_hist
+                            # Если имени нет, используем логин
+                            if not real_name:
+                                real_name = login
+
+                            # Если имя совпадает с логином, пробуем уточнить в Jira
+                            lookup_id = key if key else login
+                            if lookup_id and (not real_name or real_name == login):
+                                try:
+                                    u_d = get_jira_user_details(domain, lookup_id, method, token)
+                                    if u_d and 'displayName' in u_d:
+                                        real_name = u_d['displayName']
+                                except:
+                                    pass
+
+                            # ФИНАЛЬНАЯ ЗАЩИТА: Не пускаем None в кэш
+                            if not real_name:
+                                real_name = str(login) if login else "Unknown"
+
+                            if login:
+                                members_hist.append({
+                                    "login": login,
+                                    "key": key,
+                                    "name": real_name,
+                                    "dateFrom": str(d_from),
+                                    "dateTo": str(d_to)
+                                })
+                                # Обновляем кэш безопасно
+                                st.session_state.global_names_cache[login] = real_name
+                                if key:
+                                    st.session_state.key_to_login_map[key] = login
+
+                    if members_hist:
+                        result_map[tname] = members_hist
+
                     prog.progress((idx + 1) / len(teams))
+
                 prog.empty()
+                status_text.empty()
                 return result_map
+
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Критическая ошибка при загрузке команд: {e}")
                 return None
 
 
@@ -975,6 +1044,7 @@ if st.session_state.global_data_loaded:
             teams_conf = {}
         user_hist = {}
 
+        # --- БЛОК 1: Формирование истории (для Аналитики) ---
         for tname, mems in teams_conf.items():
             for m in mems:
                 if isinstance(m, dict):
@@ -986,10 +1056,26 @@ if st.session_state.global_data_loaded:
                             st.session_state.global_names_cache[l] = dn
                             st.session_state.global_names_cache[l_low] = dn
 
-                        sd = datetime.strptime(m.get('dateFrom'), '%Y-%m-%d').date() if m.get('dateFrom') else date(
-                            2000, 1, 1)
-                        ed = datetime.strptime(m.get('dateTo'), '%Y-%m-%d').date() if m.get('dateTo') else date(2099,
-                                                                                                                12, 31)
+                        # Более надежный парсинг дат
+                        try:
+                            raw_start = m.get('dateFrom')
+                            if raw_start and str(raw_start) not in ['None', '']:
+                                sd = datetime.strptime(str(raw_start)[:10], '%Y-%m-%d').date()
+                            else:
+                                sd = date(2000, 1, 1)
+
+                            raw_end = m.get('dateTo')
+                            if raw_end and str(raw_end) not in ['None', '']:
+                                ed = datetime.strptime(str(raw_end)[:10], '%Y-%m-%d').date()
+                            else:
+                                ed = date(2099, 12, 31)
+                        except:
+                            # Если даты кривые — ставим вечность, чтобы не потерять человека,
+                            # но это может быть причиной "лишних" людей.
+                            # Лучше так, чем краш.
+                            sd = date(2000, 1, 1)
+                            ed = date(2099, 12, 31)
+
                         if l_low not in user_hist: user_hist[l_low] = []
                         user_hist[l_low].append({"team": tname, "start": sd, "end": ed})
 
@@ -1029,7 +1115,9 @@ if st.session_state.global_data_loaded:
     gl_teams.add("Без команды")
     gl_teams = sorted(list(gl_teams))
 
-    gl_users = sorted(list(set(st.session_state.global_names_cache.values())))
+    # ФИКС: Безопасная сортировка имен (защита от None)
+    raw_names = [str(n) for n in st.session_state.global_names_cache.values() if n]
+    gl_users = sorted(list(set(raw_names)))
 
     gl_inds = set()
     for i in all_iss:
@@ -1230,7 +1318,6 @@ if st.session_state.global_data_loaded:
         avail_teams_1 = gl_teams
         if sel_proj and not df_i.empty:
             mask_p = df_i['_project_key'].isin(sel_proj)
-            # Collect teams
             teams_set = set()
             for t_list in df_i[mask_p]['_involved_teams']:
                 teams_set.update(t_list)
@@ -1238,7 +1325,7 @@ if st.session_state.global_data_loaded:
 
         sel_team = t1_c3.multiselect("Команда", avail_teams_1, key="f1_team")
 
-        # --- CASCADING USER FILTER (FIXED) ---
+        # --- CASCADING USER FILTER (FIXED with DATE INTERSECTION) ---
         avail_u1 = gl_users
         if sel_team:
             # Оставляем только тех, кто был в выбранных командах в этот период
@@ -1365,13 +1452,14 @@ if st.session_state.global_data_loaded:
 
         sel_et = ce4.multiselect("Команда", avail_teams_2, key="f2_team")
 
-        # --- CASCADING USER FILTER (FIXED) ---
+        # --- CASCADING USER FILTER (FIXED with DATE INTERSECTION) ---
         avail_u2 = gl_users
         if sel_et:
             valid_users = set()
             for login_low, history in user_hist.items():
                 for record in history:
                     if record['team'] in sel_et:
+                        # Проверка пересечения дат
                         if record['start'] <= e_date and record['end'] >= s_date:
                             dname = st.session_state.global_names_cache.get(login_low)
                             if dname: valid_users.add(dname)
@@ -1516,13 +1604,14 @@ if st.session_state.global_data_loaded:
 
         sel_t = cd3.multiselect("Команда", avail_teams_3, key="f3_team")
 
-        # --- CASCADING USER FILTER (FIXED) ---
+        # --- CASCADING USER FILTER (FIXED with DATE INTERSECTION) ---
         avail_u3 = gl_users
         if sel_t:
             valid_users = set()
             for login_low, history in user_hist.items():
                 for record in history:
                     if record['team'] in sel_t:
+                        # Проверка пересечения дат
                         if record['start'] <= e_date and record['end'] >= s_date:
                             dname = st.session_state.global_names_cache.get(login_low)
                             if dname: valid_users.add(dname)
@@ -1658,7 +1747,8 @@ if st.session_state.global_data_loaded:
                 if nm not in name_to_login_map:
                     name_to_login_map[nm] = lg
 
-            all_known_names = sorted(list(name_to_login_map.keys()))
+            # Фильтруем пустые ключи (None) и приводим всё к строке перед сортировкой
+            all_known_names = sorted([str(k) for k in name_to_login_map.keys() if k])
 
             c_teams, c_users = st.columns(2)
 
@@ -1674,15 +1764,32 @@ if st.session_state.global_data_loaded:
                         for t_name, members in available_teams_map.items():
                             if t_name == t:
                                 for m in members:
-                                    # Проверяем даты членства прямо здесь
+                                    # Строгая проверка дат
                                     try:
-                                        m_from = datetime.strptime(m.get('dateFrom'), '%Y-%m-%d').date()
-                                        m_to = datetime.strptime(m.get('dateTo'), '%Y-%m-%d').date()
+                                        # 1. Парсим дату начала
+                                        raw_from = m.get('dateFrom')
+                                        if raw_from and str(raw_from) not in ['None', '']:
+                                            m_from = datetime.strptime(str(raw_from)[:10], '%Y-%m-%d').date()
+                                        else:
+                                            m_from = date(2000, 1, 1)
+
+                                        # 2. Парсим дату окончания
+                                        raw_to = m.get('dateTo')
+                                        if raw_to and str(raw_to) not in ['None', '']:
+                                            m_to = datetime.strptime(str(raw_to)[:10], '%Y-%m-%d').date()
+                                        else:
+                                            m_to = date(2099, 12, 31)
+
+                                        # 3. Логика пересечения: (StartA <= EndB) и (EndA >= StartB)
+                                        # Сотрудник работал в период [m_from, m_to]
+                                        # Мы смотрим отчет за [current_s_date, current_e_date]
                                         if m_from <= current_e_date and m_to >= current_s_date:
-                                            subset_logins.add(m.get('login'))
-                                    except:
-                                        # Если даты кривые, на всякий случай добавляем
-                                        subset_logins.add(m.get('login'))
+                                            l_val = m.get('login')
+                                            if l_val: subset_logins.add(l_val)
+
+                                    except Exception:
+                                        # Если даты битые - НЕ добавляем (строгий режим)
+                                        pass
 
                     filtered_names = [n for n in all_known_names if name_to_login_map.get(n) in subset_logins]
 
