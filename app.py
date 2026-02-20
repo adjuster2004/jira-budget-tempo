@@ -119,6 +119,9 @@ def load_snapshot():
                 st.session_state.account_id = data.get('account_id', '')
                 st.session_state.is_custom_jql_snapshot = data.get('is_custom_jql', False)
                 st.session_state.extra_epics_cache = data.get('extra_epics_cache', {})
+                st.session_state.extra_types_cache = data.get('extra_types_cache', {})
+                st.session_state.extra_parent_map = data.get('extra_parent_map', {})
+                st.session_state.extra_users_cache = data.get('extra_users_cache', {})
 
                 if 'global_names_cache' in data:
                     st.session_state.global_names_cache.update(data['global_names_cache'])
@@ -173,7 +176,6 @@ def parse_tempo_date(date_val):
 
 
 def extract_period_from_excel(df_head):
-    """Попытка найти две даты в шапке (начало и конец периода)"""
     dates = []
     for idx, row in df_head.iterrows():
         for item in row:
@@ -192,59 +194,44 @@ def extract_period_from_excel(df_head):
 
 
 def check_name_match(jira_name, excel_name):
-    """
-    Сравнение с учетом инициала имени и частиц (уулу, оглы).
-    Excel: Фамилия И. О. (или И.О.) + возможные частицы
-    Jira: Имя Фамилия
-    """
     if not jira_name or not excel_name: return False
 
-    # Нормализация: нижний регистр, точки -> пробелы
     j_norm = str(jira_name).lower().replace('.', ' ').strip()
     e_norm = str(excel_name).lower().replace('.', ' ').strip()
 
-    # Разбиваем на части
     j_parts_raw = j_norm.split()
     e_parts_raw = e_norm.split()
 
-    # Фильтрация частиц (стоп-слов)
     stop_words = {'уулу', 'оглы', 'кызы', 'uulu', 'ogly', 'kyzy'}
     j_parts = [p for p in j_parts_raw if p not in stop_words]
     e_parts = [p for p in e_parts_raw if p not in stop_words]
 
     if not j_parts or not e_parts: return False
 
-    # 1. Поиск фамилии (считаем фамилией слова длиной > 1)
     j_long = [p for p in j_parts if len(p) > 1]
     e_long = [p for p in e_parts if len(p) > 1]
 
     if not j_long or not e_long: return False
 
-    # Ищем пересечение фамилий
     common_surname = set(j_long) & set(e_long)
 
     if not common_surname:
         return False
 
-    # Если фамилия найдена, берем её
     surname = list(common_surname)[0]
 
-    # Ищем части, которые НЕ являются этой фамилией (имена/инициалы)
     j_rest = [p for p in j_parts if p != surname]
     e_rest = [p for p in e_parts if p != surname]
 
-    # Если в обоих списках есть остаток (имя/инициалы), сверяем первую букву
     if j_rest and e_rest:
         j_init = j_rest[0][0]
         e_init = e_rest[0][0]
         return j_init == e_init
 
-    # Если инициалов нет в одном из источников, считаем совпадение по фамилии достаточным
     return True
 
 
 def safe_extract_name(val):
-    """Извлекает читаемое имя из сложного объекта Jira (базовая версия)"""
     if val is None:
         return "Unknown"
     if isinstance(val, str):
@@ -261,19 +248,12 @@ def safe_extract_name(val):
 # --- ФУНКЦИИ ДЛЯ CONFLUENCE ---
 
 def format_links_in_df(df, columns_to_format):
-    """
-    Преобразует URL в макрос HTML для открытия в новой вкладке.
-    Confluence удаляет target='_blank' из обычного HTML, поэтому используем {html}.
-    """
     df_out = df.copy()
     for col in columns_to_format:
         if col in df_out.columns:
             def make_link(val):
                 if isinstance(val, str) and val.startswith("http"):
-                    # Извлекаем ключ (например, из https://jira.com/browse/PROJ-123 берем PROJ-123)
                     key = val.rstrip('/').split('/')[-1]
-                    # Оборачиваем в макрос {html}, чтобы сохранить атрибут target="_blank"
-                    # Внимание: для работы этого метода в Confluence должен быть включен макрос "html".
                     return (
                         f'<ac:structured-macro ac:name="html">'
                         f'<ac:plain-text-body><![CDATA['
@@ -286,10 +266,6 @@ def format_links_in_df(df, columns_to_format):
     return df_out
 
 def wrap_with_chart_macro(table_html, chart_type="Pie", label_col="", value_col="", title="", height=400):
-    """
-    Оборачивает таблицу в макрос 'Chart from Table' (Stiltsoft).
-    Используется внутреннее имя макроса 'table-chart'.
-    """
     macro_xml = f"""
     <h3>{title}</h3>
     <ac:structured-macro ac:name="table-chart" ac:schema-version="1">
@@ -308,12 +284,7 @@ def wrap_with_chart_macro(table_html, chart_type="Pie", label_col="", value_col=
 
 
 def export_to_confluence_advanced(url, username, token, page_id, title, html_body, attachments=None, is_cloud=True, report_period=None):
-    """
-    Продвинутый экспорт: принимает готовый HTML и список вложений.
-    report_period: строка периода для заголовка (опционально)
-    """
     try:
-        # Очистка Page ID
         page_id = str(page_id).strip()
         if not page_id.isdigit():
             return False, f"Ошибка: ID страницы должен быть числом. Вы ввели: '{page_id}'"
@@ -323,7 +294,6 @@ def export_to_confluence_advanced(url, username, token, page_id, title, html_bod
         else:
             confluence = Confluence(url=url, token=token)
 
-        # 1. Проверка страницы
         try:
             page_info = confluence.get_page_by_id(page_id, expand='space,version')
         except Exception as e:
@@ -334,7 +304,6 @@ def export_to_confluence_advanced(url, username, token, page_id, title, html_bod
 
         current_page_title = page_info.get('title', title)
 
-        # 2. Загрузка вложений (Устарело для графиков, но может использоваться для других файлов)
         if attachments:
             for att in attachments:
                 fname = att['filename']
@@ -352,8 +321,6 @@ def export_to_confluence_advanced(url, username, token, page_id, title, html_bod
                 except Exception as e:
                     pass
 
-        # 3. Обновление контента
-        # Формируем заголовок с датой и периодом
         header_html = f"<p><em>Отчет сформирован: {datetime.now().strftime('%Y-%m-%d %H:%M')}</em></p>"
         if report_period:
             header_html += f"<p><strong>Период: {report_period}</strong></p>"
@@ -376,13 +343,10 @@ def export_to_confluence_advanced(url, username, token, page_id, title, html_bod
 
 
 def df_to_confluence_html(df):
-    """Конвертирует DataFrame в HTML таблицу Confluence с поддержкой длинного XML"""
     if df.empty:
         return "<p>Нет данных</p>"
 
-    # ВАЖНО: Устанавливаем max_colwidth в None, чтобы Pandas не обрезал длинный XML код макросов
     with pd.option_context('display.max_colwidth', None):
-        # escape=False нужен, чтобы теги <ac:...> не экранировались
         table_html = df.to_html(index=False, classes="confluenceTable", border=1, escape=False)
 
     table_html = table_html.replace('class="dataframe confluenceTable"', 'class="confluenceTable"')
@@ -414,7 +378,11 @@ if 'global_data_loaded' not in st.session_state:
     st.session_state.epic_link_id = ""
     st.session_state.account_id = ""
     st.session_state.is_custom_jql_snapshot = False
+
     st.session_state.extra_epics_cache = {}
+    st.session_state.extra_types_cache = {}
+    st.session_state.extra_parent_map = {}
+    st.session_state.extra_users_cache = {}
     load_snapshot()
 
 if 'jira_meta' not in st.session_state: st.session_state.jira_meta = load_meta()
@@ -666,8 +634,6 @@ with st.sidebar:
 
         conf_token = st.text_input("Token / PAT", value=config.get("conf_token", ""), type="password")
 
-        # Убрали глобальный Page ID отсюда, теперь он в табах
-
         if st.button("💾 Сохранить настройки Confluence"):
             cur_conf = load_config()
             cur_conf.update({
@@ -729,9 +695,7 @@ with st.sidebar:
 
     with st.expander("👥 Tempo Команды (Конфиг)"):
         def fetch_tempo_teams_history(domain, method, token):
-            # ИСПОЛЬЗУЕМ V2 MEMBER (он у вас работает и отдает JSON)
             url_base = f"https://{domain}/rest/tempo-teams/2/team"
-
             headers = {"Content-Type": "application/json"}
             cookies = {}
             if method == "Personal Access Token (PAT)":
@@ -740,7 +704,6 @@ with st.sidebar:
                 cookies = {"JSESSIONID": token}
 
             try:
-                # 1. Получаем список команд
                 resp = requests.get(url_base, headers=headers, cookies=cookies, verify=False)
                 if resp.status_code != 200:
                     st.error(f"Ошибка получения команд: {resp.status_code}")
@@ -757,7 +720,6 @@ with st.sidebar:
                     tname = team.get('name')
                     status_text.text(f"Сканируем команду: {tname}...")
 
-                    # 2. Запрашиваем участников
                     m_url = f"{url_base}/{tid}/member"
                     m_resp = requests.get(m_url, headers=headers, cookies=cookies, verify=False)
 
@@ -766,43 +728,31 @@ with st.sidebar:
                         raw_members = m_resp.json()
 
                         for m in raw_members:
-                            # --- БЛОК 1: ДАТЫ (ANSI) ---
-                            # Данные лежат внутри объекта 'membership'
                             mem_obj = m.get('membership', {})
-
-                            # Приоритет ANSI полям (формат 2024-01-10)
                             raw_from = mem_obj.get('dateFromANSI')
                             raw_to = mem_obj.get('dateToANSI')
 
-                            # Если ANSI нет, пробуем обычные (fallback)
                             if not raw_from: raw_from = mem_obj.get('dateFrom') or m.get('dateFrom')
                             if not raw_to: raw_to = mem_obj.get('dateTo') or m.get('dateTo')
 
-                            # Парсинг даты начала
-                            d_from = date(2000, 1, 1) # Дефолт
+                            d_from = date(2000, 1, 1)
                             if raw_from and str(raw_from).strip():
                                 parsed = parse_tempo_date(raw_from)
                                 if parsed: d_from = parsed
 
-                            # Парсинг даты конца
-                            d_to = date(2099, 12, 31) # Дефолт
+                            d_to = date(2099, 12, 31)
                             if raw_to and str(raw_to).strip():
                                 parsed = parse_tempo_date(raw_to)
                                 if parsed: d_to = parsed
 
-                            # --- БЛОК 2: ИМЕНА (Защита от None) ---
                             m_info = m.get('member', {})
                             login = m_info.get('name')
                             key = m_info.get('key')
-
-                            # Имя из Tempo
                             real_name = m_info.get('displayName')
 
-                            # Если имени нет, используем логин
                             if not real_name:
                                 real_name = login
 
-                            # Если имя совпадает с логином, пробуем уточнить в Jira
                             lookup_id = key if key else login
                             if lookup_id and (not real_name or real_name == login):
                                 try:
@@ -812,7 +762,6 @@ with st.sidebar:
                                 except:
                                     pass
 
-                            # ФИНАЛЬНАЯ ЗАЩИТА: Не пускаем None в кэш
                             if not real_name:
                                 real_name = str(login) if login else "Unknown"
 
@@ -824,7 +773,6 @@ with st.sidebar:
                                     "dateFrom": str(d_from),
                                     "dateTo": str(d_to)
                                 })
-                                # Обновляем кэш безопасно
                                 st.session_state.global_names_cache[login] = real_name
                                 if key:
                                     st.session_state.key_to_login_map[key] = login
@@ -944,8 +892,7 @@ if run_btn:
             st.info("🔍 Итоговый JQL:")
             st.code(jql, language="sql")
 
-        # Добавляем COMPANY_FIELD_ID в запрос
-        base_f = ['key', 'summary', 'timespent', 'status', 'creator', 'labels', 'issuetype', sel_wt_id, sel_epic_link_id, INDUSTRY_FIELD_ID, COMPANY_FIELD_ID]
+        base_f = ['key', 'summary', 'timespent', 'status', 'creator', 'assignee', 'labels', 'issuetype', 'issuelinks', sel_wt_id, sel_epic_link_id, INDUSTRY_FIELD_ID, COMPANY_FIELD_ID]
         if sel_account_id: base_f.append(sel_account_id)
         final_f = list(set(base_f + sel_extra_ids))
 
@@ -983,21 +930,76 @@ if run_btn:
                     f_map = {fid: meta_fields.get(fid, fid) for fid in final_f}
 
                     extra_epics_map = {}
+                    extra_types_map = {}
+                    extra_parent_map = {}
+                    extra_users_map = {}
                     referenced_epics = set()
+                    loaded_keys = {i['key'] for i in issues}
+
+                    # Проверяем, нужно ли нам вообще грузить иерархию Портфелей
+                    need_portfolio_hierarchy = ("PROJECT" in sel_projects) or use_custom_jql
+
+                    # Собираем все ссылки
                     for i in issues:
+                        # 1. Обычные ссылки на Эпики (нужны всегда)
                         elink = i['fields'].get(sel_epic_link_id)
                         if elink: referenced_epics.add(elink)
-                    loaded_keys = {i['key'] for i in issues}
+
+                        # 2. Связи "Декомпозирована на" (нужны только если грузим PROJECT)
+                        if need_portfolio_hierarchy:
+                            for link in i['fields'].get('issuelinks', []):
+                                l_type = link.get('type', {})
+                                name_str = (l_type.get('name', '') + l_type.get('inward', '') + l_type.get('outward', '')).lower()
+                                if 'декомпозирована' in name_str:
+                                    target = link.get('outwardIssue') or link.get('inwardIssue')
+                                    if target: referenced_epics.add(target.get('key'))
+
                     missing_epics = list(referenced_epics - loaded_keys)
-                    if missing_epics:
-                        st.write(f"⏳ Догружаем {len(missing_epics)} эпиков...")
+
+                    # Рекурсивная догрузка
+                    depth = 0
+                    # Если Портфели не нужны, делаем только 1 проход (для названий Эпиков). Иначе - до 3 уровней вглубь.
+                    max_depth = 3 if need_portfolio_hierarchy else 1
+
+                    while missing_epics and depth < max_depth:
+                        depth += 1
+
+                        if need_portfolio_hierarchy:
+                            st.write(f"⏳ Догружаем {len(missing_epics)} связанных эпиков/портфелей (Итерация {depth})...")
+                        else:
+                            st.write(f"⏳ Догружаем {len(missing_epics)} родительских эпиков...")
+
                         chunk_size = 50
+                        new_discovered = set()
+
                         for i in range(0, len(missing_epics), chunk_size):
                             chunk = missing_epics[i:i + chunk_size]
-                            ep_data = get_all_issues(jira_domain, f"key in ({','.join(chunk)})", ["summary"],
-                                                     auth_method, api_token)
+                            ep_data = get_all_issues(jira_domain, f"key in ({','.join(chunk)})", ["summary", "issuetype", "issuelinks", "creator", "assignee"], auth_method, api_token)
                             if ep_data:
-                                for ep in ep_data: extra_epics_map[ep['key']] = ep['fields'].get('summary', '')
+                                for ep in ep_data:
+                                    ek = ep['key']
+                                    loaded_keys.add(ek)
+                                    extra_epics_map[ek] = ep['fields'].get('summary', '')
+                                    extra_types_map[ek] = ep['fields'].get('issuetype', {}).get('name', 'Unknown')
+
+                                    cr = ep['fields'].get('creator', {}).get('displayName', 'Unknown')
+                                    assig = ep['fields'].get('assignee')
+                                    assig_name = assig.get('displayName', 'Unassigned') if assig else 'Unassigned'
+                                    extra_users_map[ek] = {"creator": cr, "assignee": assig_name}
+
+                                    # Ищем родителя (Портфель) для догруженного Эпика только если активна глубокая загрузка
+                                    if need_portfolio_hierarchy:
+                                        for link in ep['fields'].get('issuelinks', []):
+                                            l_type = link.get('type', {})
+                                            name_str = (l_type.get('name', '') + l_type.get('inward', '') + l_type.get('outward', '')).lower()
+                                            if 'декомпозирована' in name_str:
+                                                target = link.get('outwardIssue') or link.get('inwardIssue')
+                                                if target:
+                                                    t_key = target.get('key')
+                                                    extra_parent_map[ek] = t_key
+                                                    if t_key not in loaded_keys:
+                                                        new_discovered.add(t_key)
+                        missing_epics = list(new_discovered)
 
                     st.session_state.raw_issues_data = issues
                     st.session_state.raw_worklogs_data = wl_cache
@@ -1007,7 +1009,11 @@ if run_btn:
                     st.session_state.epic_link_id = sel_epic_link_id
                     st.session_state.account_id = sel_account_id
                     st.session_state.is_custom_jql_snapshot = use_custom_jql
+
                     st.session_state.extra_epics_cache = extra_epics_map
+                    st.session_state.extra_types_cache = extra_types_map
+                    st.session_state.extra_parent_map = extra_parent_map
+                    st.session_state.extra_users_cache = extra_users_map
 
                     st.session_state.tempo_raw_worklogs = []
                     st.session_state.tempo_accounts_map = {}
@@ -1022,7 +1028,11 @@ if run_btn:
                             "issues": issues, "worklogs": wl_cache, "medians": medians,
                             "fields_map": f_map, "work_type_id": sel_wt_id,
                             "epic_link_id": sel_epic_link_id, "account_id": sel_account_id,
-                            "is_custom_jql": use_custom_jql, "extra_epics_cache": extra_epics_map,
+                            "is_custom_jql": use_custom_jql,
+                            "extra_epics_cache": extra_epics_map,
+                            "extra_types_cache": extra_types_map,
+                            "extra_parent_map": extra_parent_map,
+                            "extra_users_cache": extra_users_map,
                             "global_names_cache": st.session_state.global_names_cache,
                             "key_to_login_map": st.session_state.key_to_login_map
                         }, f)
@@ -1056,7 +1066,6 @@ if st.session_state.global_data_loaded:
                             st.session_state.global_names_cache[l] = dn
                             st.session_state.global_names_cache[l_low] = dn
 
-                        # Более надежный парсинг дат
                         try:
                             raw_start = m.get('dateFrom')
                             if raw_start and str(raw_start) not in ['None', '']:
@@ -1070,9 +1079,6 @@ if st.session_state.global_data_loaded:
                             else:
                                 ed = date(2099, 12, 31)
                         except:
-                            # Если даты кривые — ставим вечность, чтобы не потерять человека,
-                            # но это может быть причиной "лишних" людей.
-                            # Лучше так, чем краш.
                             sd = date(2000, 1, 1)
                             ed = date(2099, 12, 31)
 
@@ -1092,10 +1098,7 @@ if st.session_state.global_data_loaded:
 
     s_date = an_range[0]
     e_date = an_range[1] if len(an_range) > 1 else an_range[0]
-
-    # ФОРМИРОВАНИЕ СТРОКИ ПЕРИОДА ДЛЯ ОТЧЕТА
     period_str = f"{s_date.strftime('%Y/%m/%d')} – {e_date.strftime('%Y/%m/%d')}"
-
     s_ds, e_ds = s_date.strftime('%Y-%m-%d'), e_date.strftime('%Y-%m-%d')
 
     all_iss = st.session_state.raw_issues_data
@@ -1107,7 +1110,6 @@ if st.session_state.global_data_loaded:
     account_id = st.session_state.account_id
     extra_epics_cache = st.session_state.extra_epics_cache
 
-    # --- GLOBAL LISTS ---
     gl_projects = sorted(list(set(i['key'].split('-')[0] for i in all_iss)))
 
     gl_teams = set()
@@ -1115,7 +1117,6 @@ if st.session_state.global_data_loaded:
     gl_teams.add("Без команды")
     gl_teams = sorted(list(gl_teams))
 
-    # ФИКС: Безопасная сортировка имен (защита от None)
     raw_names = [str(n) for n in st.session_state.global_names_cache.values() if n]
     gl_users = sorted(list(set(raw_names)))
 
@@ -1139,16 +1140,13 @@ if st.session_state.global_data_loaded:
         k = iss['key']
         f = iss['fields']
 
-        # Получаем данные компании (с кэшированием Insight)
         company_val_raw = f.get(COMPANY_FIELD_ID)
         company_name = "Unknown Company"
 
-        # Логика извлечения имени компании с поддержкой Insight
         if isinstance(company_val_raw, dict):
             company_name = safe_extract_name(company_val_raw)
         elif isinstance(company_val_raw, list) and company_val_raw:
             raw_str = str(company_val_raw[0])
-            # Проверяем формат "ID (KEY)" - признак Insight на Data Center
             match = re.search(r'\((CLIBD-\d+)\)', raw_str)
             if match:
                 ins_key = match.group(1)
@@ -1305,16 +1303,24 @@ if st.session_state.global_data_loaded:
         st.session_state.main_tabs_radio = "📋 Задачи"
 
     tabs_list = ["📋 Задачи", "🚀 Эпики", "👥 Детализация", "✅ QC Темпо", "📂 Табель"]
+
+    # Добавляем вкладку "Портфели" только если PROJECT есть в списке загруженных проектов
+    if "PROJECT" in gl_projects:
+        tabs_list.insert(2, "💼 Портфели")
+
     selected_tab = st.radio("Раздел", tabs_list, horizontal=True, key="main_tabs_radio")
 
     if selected_tab == "📋 Задачи":
         df_i = pd.DataFrame(rows_iss) if rows_iss else pd.DataFrame()
 
         t1_c1, t1_c2, t1_c3, t1_c4 = st.columns(4)
-        sel_proj = t1_c1.multiselect("Проект", gl_projects, key="f1_proj")
-        sel_ind = t1_c2.multiselect("Отрасль", gl_inds, key="f1_ind")
 
-        # --- CASCADING TEAM FILTER ---
+        sel_proj = t1_c1.multiselect("Проект", gl_projects, key="f1_proj")
+        nor_proj = t1_c1.checkbox("NOR (исключить)", key="n1_proj")
+
+        sel_ind = t1_c2.multiselect("Отрасль", gl_inds, key="f1_ind")
+        nor_ind = t1_c2.checkbox("NOR (исключить)", key="n1_ind")
+
         avail_teams_1 = gl_teams
         if sel_proj and not df_i.empty:
             mask_p = df_i['_project_key'].isin(sel_proj)
@@ -1324,23 +1330,19 @@ if st.session_state.global_data_loaded:
             avail_teams_1 = sorted(list(teams_set))
 
         sel_team = t1_c3.multiselect("Команда", avail_teams_1, key="f1_team")
+        nor_team = t1_c3.checkbox("NOR (исключить)", key="n1_team")
 
-        # --- CASCADING USER FILTER (FIXED with DATE INTERSECTION) ---
         avail_u1 = gl_users
         if sel_team:
-            # Оставляем только тех, кто был в выбранных командах в этот период
             valid_users = set()
             for login_low, history in user_hist.items():
                 for record in history:
                     if record['team'] in sel_team:
-                        # Проверка пересечения отрезков [record.start, record.end] и [s_date, e_date]
                         if record['start'] <= e_date and record['end'] >= s_date:
                             dname = st.session_state.global_names_cache.get(login_low)
                             if dname: valid_users.add(dname)
 
-            # Обработка "Без команды"
             if "Без команды" in sel_team and not df_i.empty:
-                # Добавляем всех, кто есть в текущем DataFrame с пометкой "Без команды"
                 no_team_users = df_i[df_i['_involved_teams'].apply(lambda x: "Без команды" in x)][
                     '_involved_users'].explode()
                 valid_users.update(no_team_users.dropna().unique())
@@ -1348,14 +1350,23 @@ if st.session_state.global_data_loaded:
             avail_u1 = sorted(list(valid_users))
 
         sel_user = t1_c4.multiselect("Сотрудник", avail_u1, key="f1_user")
+        nor_user = t1_c4.checkbox("NOR (исключить)", key="n1_user")
 
         if not df_i.empty:
             def filter_tab1(row):
-                return (not sel_proj or row['_project_key'] in sel_proj) and \
-                       (not sel_ind or row['_industry'] in sel_ind) and \
-                       (not sel_team or not set(row['_involved_teams']).isdisjoint(sel_team)) and \
-                       (not sel_user or not set(row['_involved_users']).isdisjoint(sel_user))
+                cond_proj = (row['_project_key'] not in sel_proj) if nor_proj else (row['_project_key'] in sel_proj)
+                if not sel_proj: cond_proj = True
 
+                cond_ind = (row['_industry'] not in sel_ind) if nor_ind else (row['_industry'] in sel_ind)
+                if not sel_ind: cond_ind = True
+
+                cond_team = set(row['_involved_teams']).isdisjoint(sel_team) if nor_team else not set(row['_involved_teams']).isdisjoint(sel_team)
+                if not sel_team: cond_team = True
+
+                cond_user = set(row['_involved_users']).isdisjoint(sel_user) if nor_user else not set(row['_involved_users']).isdisjoint(sel_user)
+                if not sel_user: cond_user = True
+
+                return cond_proj and cond_ind and cond_team and cond_user
 
             df_i_final = df_i[df_i.apply(filter_tab1, axis=1)].drop(
                 columns=['_project_key', '_involved_teams', '_involved_users', '_industry'])
@@ -1365,9 +1376,7 @@ if st.session_state.global_data_loaded:
                                                                               display_text="https://.*/browse/(.*)")},
                          use_container_width=True, hide_index=True)
 
-            # --- CONFLUENCE EXPORT TAB 1 ---
             with st.expander("📤 Экспорт в Confluence"):
-                # Поле Page ID для этой закладки
                 page_id_tasks = st.text_input("Confluence Page ID (Задачи)",
                                               value=config.get("page_id_tasks", ""),
                                               key="pid_tasks")
@@ -1376,7 +1385,6 @@ if st.session_state.global_data_loaded:
                     if not page_id_tasks:
                         st.error("Введите Page ID!")
                     else:
-                        # Сохраняем в конфиг (чтобы не вводить каждый раз)
                         current_conf = load_config()
                         current_conf['page_id_tasks'] = page_id_tasks
                         save_config(current_conf)
@@ -1390,15 +1398,9 @@ if st.session_state.global_data_loaded:
                         if not (c_url and c_token):
                             st.error("Настройки подключения Confluence не заполнены")
                         else:
-                            # 1. Форматируем ссылки
-                            # Указываем столбцы, где лежат ссылки
                             df_export = format_links_in_df(df_i_final, ["Задача"])
-
-                            # 2. Генерируем HTML таблицы
                             table_html = df_to_confluence_html(df_export)
 
-                            # 3. Оборачиваем в макрос диаграммы
-                            # Если есть столбец "Вид работ", строим Pie chart
                             if 'Вид работ' in df_export.columns:
                                 final_html = wrap_with_chart_macro(
                                     table_html,
@@ -1410,8 +1412,6 @@ if st.session_state.global_data_loaded:
                             else:
                                 final_html = f"<h3>Список Задач</h3>{table_html}"
 
-                            # 4. Экспорт (без вложений)
-                            # Передаем report_period
                             res, msg = export_to_confluence_advanced(
                                 c_url, c_user, c_token, page_id_tasks, "Отчет: Задачи",
                                 final_html, attachments=[], is_cloud=is_cloud, report_period=period_str
@@ -1419,7 +1419,6 @@ if st.session_state.global_data_loaded:
 
                             if res: st.success(msg)
                             else: st.error(msg)
-
         else:
             st.info("Нет данных за выбранный период")
 
@@ -1428,8 +1427,12 @@ if st.session_state.global_data_loaded:
             columns=['_project_key', 'Эпик', '_industry', 'TeamsList', 'Сотрудник'])
 
         ce1, ce2, ce3, ce4, ce5 = st.columns(5)
+
         sel_ep_proj = ce1.multiselect("Проект", gl_projects, key="f2_proj")
+        nor_ep_proj = ce1.checkbox("NOR", key="n2_proj")
+
         sel_ep_ind = ce2.multiselect("Отрасль", gl_inds, key="f2_ind")
+        nor_ep_ind = ce2.checkbox("NOR", key="n2_ind")
 
         if not df_e.empty:
             df_e_p = df_e[df_e['_project_key'].isin(sel_ep_proj)] if sel_ep_proj else df_e
@@ -1437,11 +1440,12 @@ if st.session_state.global_data_loaded:
             url_to_key = {u: u.split('/')[-1] for u in all_epic_urls}
             sel_ep_keys = ce3.multiselect("Эпик", sorted(list(url_to_key.values())), key="f2_epic")
             sel_ep_urls = [k for k, v in url_to_key.items() if v in sel_ep_keys]
+            nor_ep_urls = ce3.checkbox("NOR", key="n2_epic")
         else:
             sel_ep_urls = []
+            nor_ep_urls = False
             ce3.multiselect("Эпик", [])
 
-        # --- CASCADING TEAM FILTER ---
         avail_teams_2 = gl_teams
         if sel_ep_proj and not df_e.empty:
             mask_p = df_e['_project_key'].isin(sel_ep_proj)
@@ -1451,15 +1455,14 @@ if st.session_state.global_data_loaded:
             avail_teams_2 = sorted(list(teams_set))
 
         sel_et = ce4.multiselect("Команда", avail_teams_2, key="f2_team")
+        nor_et = ce4.checkbox("NOR", key="n2_team")
 
-        # --- CASCADING USER FILTER (FIXED with DATE INTERSECTION) ---
         avail_u2 = gl_users
         if sel_et:
             valid_users = set()
             for login_low, history in user_hist.items():
                 for record in history:
                     if record['team'] in sel_et:
-                        # Проверка пересечения дат
                         if record['start'] <= e_date and record['end'] >= s_date:
                             dname = st.session_state.global_names_cache.get(login_low)
                             if dname: valid_users.add(dname)
@@ -1471,30 +1474,29 @@ if st.session_state.global_data_loaded:
             avail_u2 = sorted(list(valid_users))
 
         sel_eu = ce5.multiselect("Сотрудник", avail_u2, key="f2_user")
+        nor_eu = ce5.checkbox("NOR", key="n2_user")
 
         if not df_e.empty:
             def filter_epics_row(row):
-                p_proj = True
-                if sel_ep_proj:
-                    p_proj = row["_project_key"] in sel_ep_proj
-                p_ind = True
-                if sel_ep_ind:
-                    p_ind = row["_industry"] in sel_ep_ind
-                p_ep = True
-                if sel_ep_urls:
-                    p_ep = row["Эпик"] in sel_ep_urls
-                p_tm = True
-                if sel_et:
-                    ut = row["TeamsList"]
-                    if not ut:
-                        p_tm = "Без команды" in sel_et
-                    else:
-                        p_tm = not set(ut).isdisjoint(set(sel_et))
-                p_us = True
-                if sel_eu:
-                    p_us = row["Сотрудник"] in sel_eu
-                return p_proj and p_ind and p_ep and p_tm and p_us
+                cond_proj = (row['_project_key'] not in sel_ep_proj) if nor_ep_proj else (row['_project_key'] in sel_ep_proj)
+                if not sel_ep_proj: cond_proj = True
 
+                cond_ind = (row['_industry'] not in sel_ep_ind) if nor_ep_ind else (row['_industry'] in sel_ep_ind)
+                if not sel_ep_ind: cond_ind = True
+
+                cond_ep = (row['Эпик'] not in sel_ep_urls) if nor_ep_urls else (row['Эпик'] in sel_ep_urls)
+                if not sel_ep_urls: cond_ep = True
+
+                ut = row["TeamsList"]
+                if not ut: in_team = "Без команды" in sel_et
+                else: in_team = not set(ut).isdisjoint(set(sel_et))
+                cond_team = (not in_team) if nor_et else in_team
+                if not sel_et: cond_team = True
+
+                cond_user = (row['Сотрудник'] not in sel_eu) if nor_eu else (row['Сотрудник'] in sel_eu)
+                if not sel_eu: cond_user = True
+
+                return cond_proj and cond_ind and cond_ep and cond_team and cond_user
 
             df_ef = df_e[df_e.apply(filter_epics_row, axis=1)]
             st.dataframe(df_ef[["Эпик", "Сотрудник", "Задача", "Тема", "Отрасль", "Списано (ч)"]],
@@ -1521,7 +1523,6 @@ if st.session_state.global_data_loaded:
                               column_config={"Сумма (ч)": st.column_config.NumberColumn(format="%.2f")},
                               use_container_width=True, hide_index=True)
 
-            # --- CONFLUENCE EXPORT TAB 2 ---
             with st.expander("📤 Экспорт в Confluence"):
                 page_id_epics = st.text_input("Confluence Page ID (Эпики)",
                                               value=config.get("page_id_epics", ""),
@@ -1545,9 +1546,6 @@ if st.session_state.global_data_loaded:
                             st.error("Настройки подключения Confluence не заполнены")
                         else:
                             html_body = ""
-
-                            # --- Блок 1: Основная детализация ---
-                            # Форматируем ссылки
                             cols_to_link = ["Эпик", "Задача"]
                             df_ef_exp = format_links_in_df(df_ef[["Эпик", "Сотрудник", "Задача", "Тема", "Отрасль", "Списано (ч)"]], cols_to_link)
 
@@ -1560,8 +1558,6 @@ if st.session_state.global_data_loaded:
                             else:
                                 html_body += f"<h3>Детализация по задачам</h3>{tbl1_html}"
 
-                            # --- Блок 2: Сводка по Эпикам ---
-                            # Ссылка уже есть в 'Эпик (Ссылка)', форматируем её
                             df_ep_sum_exp = format_links_in_df(df_epic_summary, ["Эпик (Ссылка)"])
                             tbl2_html = df_to_confluence_html(df_ep_sum_exp)
 
@@ -1569,14 +1565,11 @@ if st.session_state.global_data_loaded:
                                 tbl2_html, "Pie", "Название", "Сумма (ч)", "Топ Эпиков"
                             )
 
-                            # --- Блок 3: Сводка по Проектам ---
-                            # Здесь ссылок нет, просто таблица
                             tbl3_html = df_to_confluence_html(df_proj_summary)
                             html_body += wrap_with_chart_macro(
                                 tbl3_html, "Pie", "Проект", "Сумма (ч)", "Распределение по Проектам"
                             )
 
-                            # Экспорт
                             res, msg = export_to_confluence_advanced(
                                 c_url, c_user, c_token, page_id_epics, "Отчет: Эпики",
                                 html_body, attachments=[], is_cloud=is_cloud, report_period=period_str
@@ -1586,14 +1579,241 @@ if st.session_state.global_data_loaded:
         else:
             st.info("Нет данных по эпикам")
 
+    elif selected_tab == "💼 Портфели":
+        st.markdown("### Анализ Портфелей (По связи 'Декомпозирована на')")
+
+        portfolios_data = {}
+        epics_map = {}
+
+        # 1. Извлекаем данные из основной выборки задач
+        for iss in all_iss:
+            f = iss['fields']
+            k = iss['key']
+            issue_type = f.get('issuetype', {}).get('name', '')
+
+            # Сразу извлекаем авторов для любых типов (и Портфелей, и Эпиков)
+            creator = f.get('creator', {}).get('displayName', 'Unknown')
+            assignee = f.get('assignee')
+            assignee_name = assignee.get('displayName', 'Unassigned') if assignee else 'Unassigned'
+
+            if issue_type == 'Портфель проектов':
+                portfolios_data[k] = {
+                    "summary": f.get('summary', ''),
+                    "link": f"https://{jira_domain}/browse/{k}",
+                    "type": issue_type,
+                    "creator": creator,
+                    "assignee": assignee_name
+                }
+            elif issue_type in ['Epic', 'Эпик']:
+                parent_portfolio = None
+                for link in f.get('issuelinks', []):
+                    l_type = link.get('type', {})
+                    name_str = (l_type.get('name', '') + l_type.get('inward', '') + l_type.get('outward', '')).lower()
+                    if 'декомпозирована' in name_str:
+                        target = link.get('outwardIssue') or link.get('inwardIssue')
+                        if target: parent_portfolio = target.get('key')
+
+                epics_map[k] = {
+                    "epic_key": k,
+                    "epic_summary": f.get('summary', ''),
+                    "creator": creator,
+                    "assignee": assignee_name,
+                    "parent_portfolio": parent_portfolio,
+                    "total_hours": 0.0,
+                    "type": issue_type
+                }
+
+        # 2. Добавляем данные из кэша (Портфели и Эпики, загруженные рекурсивно)
+        for e_k, e_summary in st.session_state.extra_epics_cache.items():
+            e_type = st.session_state.extra_types_cache.get(e_k, 'Unknown')
+
+            users_info = st.session_state.extra_users_cache.get(e_k, {})
+            c_name = users_info.get("creator", "Unknown (Из связи)")
+            a_name = users_info.get("assignee", "Unknown (Из связи)")
+
+            if e_type == 'Портфель проектов':
+                portfolios_data[e_k] = {
+                    "summary": e_summary,
+                    "link": f"https://{jira_domain}/browse/{e_k}",
+                    "type": e_type,
+                    "creator": c_name,
+                    "assignee": a_name
+                }
+            elif e_type in ['Epic', 'Эпик'] and e_k not in epics_map:
+                epics_map[e_k] = {
+                    "epic_key": e_k,
+                    "epic_summary": e_summary,
+                    "creator": c_name,
+                    "assignee": a_name,
+                    "parent_portfolio": st.session_state.extra_parent_map.get(e_k),
+                    "total_hours": 0.0,
+                    "type": e_type
+                }
+
+        # Дополнительная проверка на кросс-связи (если портфель ссылается на эпик)
+        for k, parent_k in st.session_state.extra_parent_map.items():
+            if parent_k and k in epics_map and not epics_map[k]["parent_portfolio"]:
+                epics_map[k]["parent_portfolio"] = parent_k
+
+        # 3. Суммируем часы из ворклогов PRESALE
+        for agg_key, wl_data in wl_aggregator.items():
+            issue_k = wl_data["issue_key"]
+            if issue_k.split('-')[0] == 'PRESALE':
+                task_obj = next((i for i in all_iss if i['key'] == issue_k), None)
+                if task_obj:
+                    ep_link = task_obj['fields'].get(epic_link_id)
+                    if ep_link and ep_link in epics_map:
+                        epics_map[ep_link]["total_hours"] += wl_data["seconds"] / 3600
+
+        # 4. Собираем таблицу
+        portfolio_rows = []
+        for ep_k, ep_v in epics_map.items():
+            if not ep_k.startswith('PROJECT-'):
+                continue
+
+            parent_key = ep_v["parent_portfolio"]
+            port_name = "—"
+            port_link = "—"
+            port_type = "—"
+            port_creator = "—"
+            port_assignee = "—"
+
+            if parent_key:
+                if parent_key in portfolios_data:
+                    port_name = portfolios_data[parent_key]["summary"]
+                    port_link = portfolios_data[parent_key]["link"]
+                    port_type = portfolios_data[parent_key]["type"]
+                    port_creator = portfolios_data[parent_key]["creator"]
+                    port_assignee = portfolios_data[parent_key]["assignee"]
+                else:
+                    port_name = str(parent_key)
+
+            portfolio_rows.append({
+                "Тип (Портфель)": port_type,
+                "Портфель": port_link,
+                "Название Портфеля": port_name,
+                "Автор Портфеля": port_creator,
+                "Исп. Портфеля": port_assignee,
+                "Тип (Эпик)": ep_v["type"],
+                "Эпик": f"https://{jira_domain}/browse/{ep_k}",
+                "Название Эпика": ep_v["epic_summary"],
+                "Автор Эпика": ep_v["creator"],
+                "Исп. Эпика": ep_v["assignee"],
+                "Часы (PRESALE)": round(ep_v["total_hours"], 2)
+            })
+
+        df_port = pd.DataFrame(portfolio_rows)
+
+        if not df_port.empty:
+            c_port1, c_port2 = st.columns(2)
+
+            # --- ФИЛЬТР: ПОРТФЕЛИ (Теперь слева - c_port1) ---
+            all_port_users = sorted(list(set(df_port["Автор Портфеля"]).union(set(df_port["Исп. Портфеля"]))))
+            sel_port_user = c_port1.multiselect("Сотрудник (Автор или Исп. Портфеля)", all_port_users, key="f_port_user")
+            nor_port_user = c_port1.checkbox("NOR (Исключить портфели сотрудника)", key="n_port_user")
+
+            # --- ФИЛЬТР: ЭПИКИ (Теперь справа - c_port2) ---
+            all_epic_users = sorted(list(set(df_port["Автор Эпика"]).union(set(df_port["Исп. Эпика"]))))
+            sel_epic_user = c_port2.multiselect("Сотрудник (Автор или Исп. Эпика)", all_epic_users, key="f_epic_user")
+            nor_epic_user = c_port2.checkbox("NOR (Исключить эпики сотрудника)", key="n_epic_user")
+
+            def filter_portfolios(row):
+                # Логика Портфеля
+                if not sel_port_user:
+                    cond_port = True
+                else:
+                    is_port_involved = (row["Автор Портфеля"] in sel_port_user) or (row["Исп. Портфеля"] in sel_port_user)
+                    cond_port = not is_port_involved if nor_port_user else is_port_involved
+
+                # Логика Эпика
+                if not sel_epic_user:
+                    cond_epic = True
+                else:
+                    is_epic_involved = (row["Автор Эпика"] in sel_epic_user) or (row["Исп. Эпика"] in sel_epic_user)
+                    cond_epic = not is_epic_involved if nor_epic_user else is_epic_involved
+
+                return cond_epic and cond_port
+
+            df_port_final = df_port[df_port.apply(filter_portfolios, axis=1)]
+            df_port_final = df_port_final.sort_values(by=["Название Портфеля", "Автор Эпика"])
+
+            st.dataframe(
+                df_port_final,
+                column_config={
+                    "Портфель": st.column_config.LinkColumn("Портфель (Ссылка)", display_text=r"https://.*/browse/(.*)"),
+                    "Эпик": st.column_config.LinkColumn("Эпик (Ссылка)", display_text=r"https://.*/browse/(.*)"),
+                    "Часы (PRESALE)": st.column_config.NumberColumn(format="%.2f")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.markdown("##### Сумма часов по Портфелям")
+            df_port_summary = df_port_final.groupby(["Портфель", "Название Портфеля"])["Часы (PRESALE)"].sum().reset_index().sort_values("Часы (PRESALE)", ascending=False)
+            st.dataframe(
+                df_port_summary,
+                column_config={"Портфель": st.column_config.LinkColumn(display_text=r"https://.*/browse/(.*)")},
+                use_container_width=True, hide_index=True
+            )
+
+            # --- ЭКСПОРТ В CONFLUENCE ---
+            with st.expander("📤 Экспорт в Confluence"):
+                page_id_ports = st.text_input("Confluence Page ID (Портфели)",
+                                              value=config.get("page_id_ports", ""),
+                                              key="pid_ports")
+
+                if st.button("Экспортировать (Портфели)"):
+                    if not page_id_ports:
+                        st.error("Введите Page ID!")
+                    else:
+                        current_conf = load_config()
+                        current_conf['page_id_ports'] = page_id_ports
+                        save_config(current_conf)
+
+                        c_url = config.get("conf_url")
+                        c_user = config.get("conf_user")
+                        c_token = config.get("conf_token")
+                        c_type = config.get("conf_type", "Cloud")
+                        is_cloud = (c_type == "Cloud")
+
+                        if not (c_url and c_token):
+                            st.error("Настройки подключения Confluence не заполнены")
+                        else:
+                            html_body = ""
+                            # Форматируем ссылки для Confluence
+                            cols_to_link = ["Портфель", "Эпик"]
+                            df_port_exp = format_links_in_df(df_port_final, cols_to_link)
+                            tbl1_html = df_to_confluence_html(df_port_exp)
+                            html_body += f"<h3>Анализ Портфелей</h3>{tbl1_html}"
+
+                            df_port_sum_exp = format_links_in_df(df_port_summary, ["Портфель"])
+                            tbl2_html = df_to_confluence_html(df_port_sum_exp)
+
+                            # Добавляем круговую диаграмму по портфелям
+                            html_body += wrap_with_chart_macro(
+                                tbl2_html, "Pie", "Название Портфеля", "Часы (PRESALE)", "Сумма часов по Портфелям"
+                            )
+
+                            res, msg = export_to_confluence_advanced(
+                                c_url, c_user, c_token, page_id_ports, "Отчет: Портфели",
+                                html_body, attachments=[], is_cloud=is_cloud, report_period=period_str
+                            )
+                            if res: st.success(msg)
+                            else: st.error(msg)
+        else:
+            st.info("Нет данных. Убедитесь, что задачи PRESALE привязаны к эпикам PROJECT, а те, в свою очередь, связаны связью 'Декомпозирована на'.")
+
     elif selected_tab == "👥 Детализация":
         df_w = pd.DataFrame(rows_wl) if rows_wl else pd.DataFrame()
 
         cd1, cd2, cd3, cd4 = st.columns(4)
-        sel_w_proj = cd1.multiselect("Проект", gl_projects, key="f3_proj")
-        sel_w_ind = cd2.multiselect("Отрасль", gl_inds, key="f3_ind")
 
-        # --- CASCADING TEAM FILTER ---
+        sel_w_proj = cd1.multiselect("Проект", gl_projects, key="f3_proj")
+        nor_w_proj = cd1.checkbox("NOR", key="n3_proj")
+
+        sel_w_ind = cd2.multiselect("Отрасль", gl_inds, key="f3_ind")
+        nor_w_ind = cd2.checkbox("NOR", key="n3_ind")
+
         avail_teams_3 = gl_teams
         if sel_w_proj and not df_w.empty:
             mask_p = df_w['_project_key'].isin(sel_w_proj)
@@ -1603,15 +1823,14 @@ if st.session_state.global_data_loaded:
             avail_teams_3 = sorted(list(teams_set))
 
         sel_t = cd3.multiselect("Команда", avail_teams_3, key="f3_team")
+        nor_t = cd3.checkbox("NOR", key="n3_team")
 
-        # --- CASCADING USER FILTER (FIXED with DATE INTERSECTION) ---
         avail_u3 = gl_users
         if sel_t:
             valid_users = set()
             for login_low, history in user_hist.items():
                 for record in history:
                     if record['team'] in sel_t:
-                        # Проверка пересечения дат
                         if record['start'] <= e_date and record['end'] >= s_date:
                             dname = st.session_state.global_names_cache.get(login_low)
                             if dname: valid_users.add(dname)
@@ -1623,24 +1842,26 @@ if st.session_state.global_data_loaded:
             avail_u3 = sorted(list(valid_users))
 
         sel_u = cd4.multiselect("Сотрудник", avail_u3, key="f3_user")
+        nor_u = cd4.checkbox("NOR", key="n3_user")
 
         if not df_w.empty:
             def filter_rows(row):
-                pp = True
-                if sel_w_proj: pp = row["_project_key"] in sel_w_proj
-                pi = True
-                if sel_w_ind: pi = row["_industry"] in sel_w_ind
-                pt = True
-                if sel_t:
-                    ut = row["TeamsList"]
-                    if not ut:
-                        pt = "Без команды" in sel_t
-                    else:
-                        pt = not set(ut).isdisjoint(set(sel_t))
-                pu = True
-                if sel_u: pu = row["Сотрудник"] in sel_u
-                return pp and pi and pt and pu
+                cond_proj = (row['_project_key'] not in sel_w_proj) if nor_w_proj else (row['_project_key'] in sel_w_proj)
+                if not sel_w_proj: cond_proj = True
 
+                cond_ind = (row['_industry'] not in sel_w_ind) if nor_w_ind else (row['_industry'] in sel_w_ind)
+                if not sel_w_ind: cond_ind = True
+
+                ut = row["TeamsList"]
+                if not ut: in_team = "Без команды" in sel_t
+                else: in_team = not set(ut).isdisjoint(set(sel_t))
+                cond_team = (not in_team) if nor_t else in_team
+                if not sel_t: cond_team = True
+
+                cond_user = (row['Сотрудник'] not in sel_u) if nor_u else (row['Сотрудник'] in sel_u)
+                if not sel_u: cond_user = True
+
+                return cond_proj and cond_ind and cond_team and cond_user
 
             df_f = df_w[df_w.apply(filter_rows, axis=1)]
             st.dataframe(df_f[["Команды", "Сотрудник", "Задача", "Тема", "Вид работ", "Отрасль", "Списано (ч)"]],
@@ -1661,7 +1882,6 @@ if st.session_state.global_data_loaded:
             df_employee_agg = df_f.groupby("Сотрудник")["Списано (ч)"].sum().reset_index().sort_values("Списано (ч)", ascending=False)
             c_s2.dataframe(df_employee_agg, use_container_width=True, hide_index=True)
 
-            # --- CONFLUENCE EXPORT TAB 3 ---
             with st.expander("📤 Экспорт в Confluence"):
                 page_id_details = st.text_input("Confluence Page ID (Детализация)",
                                               value=config.get("page_id_details", ""),
@@ -1685,8 +1905,6 @@ if st.session_state.global_data_loaded:
                             st.error("Настройки подключения Confluence не заполнены")
                         else:
                             html_body = ""
-
-                            # --- Блок 1: Главная таблица ---
                             df_f_exp = format_links_in_df(df_f[["Команды", "Сотрудник", "Задача", "Тема", "Вид работ", "Отрасль", "Списано (ч)"]], ["Задача"])
                             tbl1_html = df_to_confluence_html(df_f_exp)
 
@@ -1697,13 +1915,11 @@ if st.session_state.global_data_loaded:
                             else:
                                 html_body += f"<h3>Детальный отчет</h3>{tbl1_html}"
 
-                            # --- Блок 2: По Командам ---
                             tbl2_html = df_to_confluence_html(df_team_agg)
                             html_body += wrap_with_chart_macro(
                                 tbl2_html, "Pie", "Команда", "Часы", "Сводка по Командам"
                             )
 
-                            # --- Блок 3: По Сотрудникам ---
                             tbl3_html = df_to_confluence_html(df_employee_agg)
                             html_body += wrap_with_chart_macro(
                                 tbl3_html, "Pie", "Сотрудник", "Списано (ч)", "Сводка по Сотрудникам"
@@ -1719,7 +1935,6 @@ if st.session_state.global_data_loaded:
             st.info("Нет данных")
 
     elif selected_tab == "✅ QC Темпо":
-        # Используем даты из фильтра (s_date, e_date), а не d_start, d_end из билдера
         current_s_date = s_date
         current_e_date = e_date
         current_projects = sel_projects
@@ -1747,7 +1962,6 @@ if st.session_state.global_data_loaded:
                 if nm not in name_to_login_map:
                     name_to_login_map[nm] = lg
 
-            # Фильтруем пустые ключи (None) и приводим всё к строке перед сортировкой
             all_known_names = sorted([str(k) for k in name_to_login_map.keys() if k])
 
             c_teams, c_users = st.columns(2)
@@ -1756,7 +1970,6 @@ if st.session_state.global_data_loaded:
                 sel_load_teams = st.multiselect("Команды", team_names_list, placeholder="Выберите команды")
 
             with c_users:
-                # --- QC LOAD SECTION CASCADING (FIXED) ---
                 filtered_names = all_known_names
                 if sel_load_teams:
                     subset_logins = set()
@@ -1764,31 +1977,24 @@ if st.session_state.global_data_loaded:
                         for t_name, members in available_teams_map.items():
                             if t_name == t:
                                 for m in members:
-                                    # Строгая проверка дат
                                     try:
-                                        # 1. Парсим дату начала
                                         raw_from = m.get('dateFrom')
                                         if raw_from and str(raw_from) not in ['None', '']:
                                             m_from = datetime.strptime(str(raw_from)[:10], '%Y-%m-%d').date()
                                         else:
                                             m_from = date(2000, 1, 1)
 
-                                        # 2. Парсим дату окончания
                                         raw_to = m.get('dateTo')
                                         if raw_to and str(raw_to) not in ['None', '']:
                                             m_to = datetime.strptime(str(raw_to)[:10], '%Y-%m-%d').date()
                                         else:
                                             m_to = date(2099, 12, 31)
 
-                                        # 3. Логика пересечения: (StartA <= EndB) и (EndA >= StartB)
-                                        # Сотрудник работал в период [m_from, m_to]
-                                        # Мы смотрим отчет за [current_s_date, current_e_date]
                                         if m_from <= current_e_date and m_to >= current_s_date:
                                             l_val = m.get('login')
                                             if l_val: subset_logins.add(l_val)
 
                                     except Exception:
-                                        # Если даты битые - НЕ добавляем (строгий режим)
                                         pass
 
                     filtered_names = [n for n in all_known_names if name_to_login_map.get(n) in subset_logins]
@@ -1808,8 +2014,6 @@ if st.session_state.global_data_loaded:
             target_workers = set()
             selected_teams_map = {}
 
-            # --- ИЗМЕНЕНИЕ ЛОГИКИ: ПРИОРИТЕТ ВЫБОРА ---
-            # 1. Если выбраны конкретные сотрудники -> загружаем только их (фильтр по команде просто сузил список)
             if sel_workers_names:
                 login_to_key_map = {}
                 for t_name, members in available_teams_map.items():
@@ -1831,7 +2035,6 @@ if st.session_state.global_data_loaded:
                                     if login not in selected_teams_map: selected_teams_map[login] = set()
                                     selected_teams_map[login].add(t_name)
 
-            # 2. ИНАЧЕ, если сотрудники НЕ выбраны, но выбраны команды -> загружаем всех из команд
             elif sel_load_teams:
                 for team_name in sel_load_teams:
                     team_members = available_teams_map.get(team_name, [])
@@ -1878,7 +2081,6 @@ if st.session_state.global_data_loaded:
                         st.error("Нет токена")
                     else:
                         with st.spinner("Загрузка данных из Tempo..."):
-
                             unknowns = []
                             for w in target_workers_list:
                                 if not str(w).upper().startswith("JIRAUSER"):
@@ -2024,7 +2226,6 @@ if st.session_state.global_data_loaded:
 
                 curr_teams = set()
 
-
                 def check_hist(u_login):
                     if u_login in user_hist:
                         try:
@@ -2033,7 +2234,6 @@ if st.session_state.global_data_loaded:
                                 if rec['start'] <= wd <= rec['end']: curr_teams.add(rec['team'])
                         except:
                             pass
-
 
                 check_hist(worker_id.lower())
                 if login: check_hist(login.lower())
@@ -2075,8 +2275,8 @@ if st.session_state.global_data_loaded:
                         all_q_t.add("Без команды")
 
                 sel_qt = qc_c1.multiselect("Фильтр Команд (Таблица)", sorted(list(all_q_t)), key="qc_t")
+                nor_qt = qc_c1.checkbox("NOR", key="n_qc_t")
 
-                # --- CASCADING LOGIC QC ---
                 avail_qu = sorted(df_qc['Сотрудник'].unique())
                 if sel_qt:
                     mask_teams_only = df_qc['TeamsList'].apply(
@@ -2084,20 +2284,22 @@ if st.session_state.global_data_loaded:
                     avail_qu = sorted(df_qc[mask_teams_only]['Сотрудник'].unique())
 
                 sel_qu = qc_c2.multiselect("Фильтр Сотрудников (Таблица)", avail_qu, key="qc_u")
+                nor_qu = qc_c2.checkbox("NOR", key="n_qc_u")
 
                 mask_qc = pd.Series(True, index=df_qc.index)
-                if sel_qt: mask_qc &= df_qc['TeamsList'].apply(
-                    lambda x: not set(x).isdisjoint(sel_qt) if x else "Без команды" in sel_qt)
-                if sel_qu: mask_qc &= df_qc['Сотрудник'].isin(sel_qu)
+                if sel_qt:
+                    in_team_mask = df_qc['TeamsList'].apply(lambda x: not set(x).isdisjoint(sel_qt) if x else "Без команды" in sel_qt)
+                    mask_qc &= ~in_team_mask if nor_qt else in_team_mask
+                if sel_qu:
+                    in_user_mask = df_qc['Сотрудник'].isin(sel_qu)
+                    mask_qc &= ~in_user_mask if nor_qu else in_user_mask
 
                 df_qc_filtered = df_qc[mask_qc]
-
 
                 def highlight_errors(row):
                     if "⚠️" in row['QC Статус']:
                         return ['background-color: #ffcccc; color: black'] * len(row)
                     return [''] * len(row)
-
 
                 st.dataframe(
                     df_qc_filtered[["Сотрудник", "Таймшит", "Задача", "Списано (ч)", "Аккаунт (Ключ)", "Аккаунт (Имя)",
@@ -2116,25 +2318,18 @@ if st.session_state.global_data_loaded:
 
                 st.markdown("### 📄 Генерация текстового отчета")
                 if st.button("Сгенерировать отчет (.txt)"):
-                    # Map issues to get company name
                     issue_map = {i['key']: i for i in st.session_state.raw_issues_data}
                     report_text = ""
-                    # Group by Issue Key to aggregate comments per task
                     for i_key, grp in df_qc_filtered.groupby("_issue_key"):
-                        # 1. Company
                         company = "Unknown Company"
                         summary = ""
 
-                        # UPDATED: Получаем имя компании через агрегатор (где оно уже обработано)
-                        # или заново пытаемся разрешить
                         if i_key in wl_aggregator and "company_name" in wl_aggregator[(i_key, list(wl_aggregator.keys())[0][1])]:
-                             # Сложно достать из wl_aggregator, проще взять из issue_map
                              pass
 
                         if i_key in issue_map:
                             val = issue_map[i_key]['fields'].get(COMPANY_FIELD_ID)
 
-                            # Логика извлечения с Insight
                             if isinstance(val, dict):
                                 company = safe_extract_name(val)
                             elif isinstance(val, list) and val:
@@ -2149,7 +2344,6 @@ if st.session_state.global_data_loaded:
 
                             summary = issue_map[i_key]['fields'].get('summary', '')
 
-                        # 2. Product (Account Name before :)
                         products = set()
                         for acc in grp['Аккаунт (Имя)']:
                             if acc and str(acc) != "—":
@@ -2157,7 +2351,6 @@ if st.session_state.global_data_loaded:
                                 products.add(prod_name)
                         product_str = ", ".join(sorted(list(products))) if products else "No Product"
 
-                        # 3. Comments
                         comments = [c.strip() for c in grp['Коммент'] if c and str(c).strip()]
                         comment_str = ". ".join(comments)
 
@@ -2165,7 +2358,6 @@ if st.session_state.global_data_loaded:
                             report_text += f"{company} ({product_str}) {summary} {comment_str}\n\n"
 
                     st.download_button("Скачать отчет", report_text, file_name="report_confluence.txt")
-
 
             else:
                 st.info("Нет данных (буфер пуст).")
@@ -2187,20 +2379,14 @@ if st.session_state.global_data_loaded:
 
         if uploaded_file:
             try:
-                # Читаем файл без заголовков, так как структура сложная
                 df_raw = pd.read_excel(uploaded_file, header=None)
 
-                # 1. Пытаемся найти период в шапке
                 p_start, p_end = extract_period_from_excel(df_raw.head(20))
                 if p_start and p_end:
                     st.success(
                         f"📅 Отчетный период: **{p_start.strftime('%d.%m.%Y')} — {p_end.strftime('%d.%m.%Y')}**")
                 else:
                     st.warning("⚠️ Не удалось автоматически определить период в шапке файла.")
-
-                # 2. Парсим данные
-                # Стратегия: Ищем строку, где есть слово "Фамилия" - это будет наш "Header"
-                # Данные идут ниже.
 
                 header_row_idx = None
                 name_col_idx = None
@@ -2214,23 +2400,13 @@ if st.session_state.global_data_loaded:
                     if header_row_idx is not None: break
 
                 if header_row_idx is not None:
-                    # Ищем колонку с часами. Обычно это колонка с цифрами в правой части.
-                    # В T-13 "Отработано за месяц часы" обычно в конце.
-                    # Попробуем найти колонку, где в header row (или соседних) есть слово "часы" и "месяц"
-
-                    # Эвристика: ищем колонку "месяц" или "часы" в шапке
                     hours_col_idx = None
                     for col_idx in range(len(df_raw.columns) - 1, -1, -1):
-                        # Проверяем 10 строк заголовка
                         is_target = False
                         for r in range(header_row_idx - 5, header_row_idx + 5):
                             if r < 0 or r >= len(df_raw): continue
                             val = str(df_raw.iloc[r, col_idx]).lower()
-                            # Ищем ключевые слова
                             if "месяц" in val or "month" in val:
-                                # Часто "дни" и "часы" под "месяц".
-                                # Проверим, не является ли это колонкой "дни" (если они разделены)
-                                # Но в Т-13 это обычно одна колонка.
                                 is_target = True
                                 break
                         if is_target:
@@ -2238,52 +2414,37 @@ if st.session_state.global_data_loaded:
                             break
 
                     if hours_col_idx is None:
-                        # Fallback: берем последнюю колонку, которая не пустая
                         for col_idx in range(len(df_raw.columns) - 1, -1, -1):
-                            # Проверяем, есть ли данные в середине файла
                             sample_data = df_raw.iloc[len(df_raw) // 2, col_idx]
                             if pd.notna(sample_data):
                                 hours_col_idx = col_idx
                                 break
 
-                    # Извлекаем данные
                     extracted_rows = []
-
-                    # Начинаем сканировать строки после заголовка
-                    # Пропускаем сам заголовок и пару строк под ним (обычно там 1-2 строки цифр колонок)
                     start_data_idx = header_row_idx + 1
 
                     for i in range(start_data_idx, len(df_raw)):
                         row = df_raw.iloc[i]
                         raw_name = row[name_col_idx]
 
-                        # Пропускаем пустые строки или строки без текста
                         if pd.isna(raw_name): continue
                         s_name = str(raw_name).strip()
                         if len(s_name) < 2: continue
 
-                        # Фильтр заголовков и подвалов, если они попались в данных
                         s_name_lower = s_name.lower()
                         bad_keywords = ["фамилия", "инициалы", "должность", "итого", "ответственный", "руководитель",
                                         "специальность", "профессия"]
                         if any(k in s_name_lower for k in bad_keywords):
                             continue
 
-                        # Очистка имени: берем только первую строку до переноса, убираем скобки
-                        # Пример: "Иванов И.И.\n(инженер)" -> "Иванов И.И."
                         clean_name = s_name.split('\n')[0].strip()
                         clean_name = clean_name.split('(')[0].strip()
 
-                        # Поиск часов.
-                        # В T-13 строка сотрудника часто объединена (2-4 строки Excel).
-                        # Часы могут быть в текущей строке или в одной из следующих 3-х.
-                        # Мы ищем числа в колонке часов в диапазоне [i, i+4] и берем максимум.
                         candidates = []
                         scan_range = 4
                         for offset in range(scan_range):
                             if i + offset >= len(df_raw): break
 
-                            # Если в следующей строке снова НЕ ПУСТОЕ имя, значит это уже другой человек -> стоп
                             if offset > 0:
                                 check_next = df_raw.iloc[i + offset, name_col_idx]
                                 if pd.notna(check_next) and len(str(check_next)) > 3:
@@ -2291,7 +2452,6 @@ if st.session_state.global_data_loaded:
 
                             val = df_raw.iloc[i + offset, hours_col_idx]
                             try:
-                                # Очистка значения перед конвертацией (замена запятой на точку, удаление пробелов)
                                 val_str = str(val).replace(',', '.').replace(' ', '')
                                 v_float = float(val_str)
                                 candidates.append(v_float)
@@ -2299,17 +2459,12 @@ if st.session_state.global_data_loaded:
                                 pass
 
                         if candidates:
-                            # Обычно часов больше, чем дней (160 vs 20), поэтому берем max
                             hours = max(candidates)
                             extracted_rows.append({"Excel Name": clean_name, "Hours": hours})
 
                     if extracted_rows:
                         df_excel = pd.DataFrame(extracted_rows)
 
-                        # 3. Сопоставление с командами (Jira)
-                        # Нам нужно найти соответствие "Ivanov I.I." -> "Ivan Ivanov" -> Team
-
-                        # Подготовка справочника Jira
                         all_jira_names = sorted(list(set(st.session_state.global_names_cache.values())))
 
                         excel_res = []
@@ -2320,16 +2475,12 @@ if st.session_state.global_data_loaded:
                             found_jira_name = None
                             found_teams = set()
 
-                            # Ищем совпадение
                             for j_name in all_jira_names:
                                 if check_name_match(j_name, e_name):
                                     found_jira_name = j_name
                                     break
 
                             if found_jira_name:
-                                # Ищем команды для этого сотрудника (по user_hist)
-                                # Нам нужен login для поиска в user_hist
-                                # Ищем логин по имени
                                 login = None
                                 for k, v in st.session_state.global_names_cache.items():
                                     if v == found_jira_name:
@@ -2337,11 +2488,8 @@ if st.session_state.global_data_loaded:
                                         break
 
                                 if login and login in user_hist:
-                                    # Проверяем команды на пересечение с периодом (если есть) или берем все
-                                    # Если период не определен, берем все
                                     for rec in user_hist[login]:
                                         if p_start and p_end:
-                                            # Если пересекается
                                             if rec['start'] <= p_end and rec['end'] >= p_start:
                                                 found_teams.add(rec['team'])
                                         else:
@@ -2357,11 +2505,8 @@ if st.session_state.global_data_loaded:
 
                         df_res = pd.DataFrame(excel_res)
 
-                        # 4. Фильтрация и отображение
-
                         st.subheader("📋 Сверка часов")
 
-                        # Сбор всех доступных команд из результата
                         all_found_teams = set()
                         for t_list in df_res['TeamsList']:
                             all_found_teams.update(t_list)
@@ -2376,7 +2521,6 @@ if st.session_state.global_data_loaded:
                         else:
                             df_final = df_res
 
-                        # Determine the standard (max hours found in the file)
                         norm_hours = df_res['Часы (Табель)'].max()
                         if pd.isna(norm_hours): norm_hours = 0
 
@@ -2386,7 +2530,7 @@ if st.session_state.global_data_loaded:
                             h = row['Часы (Табель)']
                             if h < norm_hours:
                                 return ['background-color: #ffe6e6; color: black'] * len(
-                                    row)  # Very light red, black text
+                                    row)
                             return [''] * len(row)
 
                         st.dataframe(
