@@ -27,6 +27,11 @@ docker run -d \
   jira-monitor
 ```
 
+- **или одной строкой**
+```bash
+docker run -d --name jira-app --restart unless-stopped -p 8501:8501 -v "%cd%\config.json:/app/config.json" jira-monitor
+```
+
 - **Открываем в браузере**
 http://0.0.0.0:8501/
 
